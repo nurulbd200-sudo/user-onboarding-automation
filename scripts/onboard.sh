@@ -1,73 +1,122 @@
 #!/bin/bash
-set -e
+set -Eeuo pipefail
 
-# Load common functions
+# Load shared functions and settings.
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-# Require administrator privileges
 check_root
 
-# Locate CSV file
+# Use the supplied CSV or the project's default CSV.
 CSV_FILE="${1:-$PROJECT_DIR/data/users.csv}"
 
-# Make sure the CSV exists
-if [[ ! -f "$CSV_FILE" ]]; then
-    error_exit "CSV file not found: $CSV_FILE"
-fi
+[[ -r "$CSV_FILE" ]] ||
+    error_exit "Cannot read CSV file: $CSV_FILE"
 
-# Create required groups
+# Check required commands before starting.
+for cmd in useradd usermod passwd chage install visudo; do
+    command -v "$cmd" >/dev/null 2>&1 ||
+        error_exit "Required command not found: $cmd"
+done
+
+# Create required groups.
 create_group dev
 create_group qa
 create_group ops
 
-# Create shared team directories
+# Create shared team directories with setgid permissions.
 for team in dev qa ops; do
-    install -d -o root -g "$team" -m 2770 "/projects/$team"
+    install -d -o root -g "$team" -m 2770 "/projects/$team" ||
+        error_exit "Could not configure /projects/$team"
+
     log_action "Configured /projects/$team"
 done
 
-# Read users from CSV
-while IFS=, read -r username full_name team role || [[ -n "$username" ]]; do
+# Read the CSV file.
+line_number=0
+ops_needed=false
 
-    # Skip the header and empty lines
-    [[ "$username" == "username" || -z "$username" ]] && continue
+while IFS=, read -r username full_name team role || [[ -n "${username:-}" ]]; do
+    ((line_number += 1))
 
-    # Validate team
+    # Skip the header.
+    if [[ "$line_number" -eq 1 ]]; then
+        [[ "$username" == "username" ]] ||
+            error_exit "Incorrect CSV header"
+        continue
+    fi
+
+    # Skip blank lines.
+    [[ -z "${username//[[:space:]]/}" ]] && continue
+
+    # Remove surrounding whitespace.
+    username="$(echo "$username" | xargs)"
+    full_name="$(echo "$full_name" | xargs)"
+    team="$(echo "$team" | xargs)"
+    role="$(echo "$role" | xargs)"
+
+    # Validate the username.
+    [[ "$username" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] ||
+        error_exit "Invalid username on CSV line $line_number"
+
+    [[ -n "$full_name" && "$full_name" != *:* ]] ||
+        error_exit "Invalid full name for $username"
+
+    # Validate team and role.
     case "$team" in
         dev|qa|ops) ;;
         *) error_exit "Invalid team: $team" ;;
     esac
 
-    # Validate role
     case "$role" in
         developer|ops) ;;
         *) error_exit "Invalid role: $role" ;;
     esac
 
-    # Check for existing user
-    if id "$username" &>/dev/null; then
+    if [[ "$role" == "ops" ]]; then
+        [[ "$team" == "ops" ]] ||
+            error_exit "Ops role must belong to ops team: $username"
+
+        ops_needed=true
+    fi
+
+    # Do not modify an existing account.
+    if id "$username" >/dev/null 2>&1; then
         log_action "User already exists; skipping: $username"
         continue
     fi
 
-    # Create user with home directory and primary team group
-    useradd -m -s /bin/bash -g "$team" -c "$full_name" "$username"
-    log_action "Created user: $username (team: $team)"
+    # Create user with a home directory and primary team group.
+    useradd -m -s /bin/bash -g "$team" \
+        -c "$full_name" "$username" ||
+        error_exit "Could not create user: $username"
 
-    # Keep password locked until a temporary password is securely set
-    passwd -l "$username" >/dev/null
-    chage -d 0 "$username"
-    log_action "Locked password pending secure setup: $username"
+    log_action "Created user $username with primary group $team"
 
-    # Add ops-role users to the ops group
+    # Set a temporary password interactively.
+    # Password input is not saved in the log.
+    echo "Set a temporary password for $username."
+    passwd "$username" </dev/tty ||
+        error_exit "Could not set password for $username"
+
+    # Force a password change at the next password-based login.
+    chage -d 0 "$username" ||
+        error_exit "Could not set password expiry for $username"
+
+    log_action "Temporary password set; first-login change required for $username"
+
+    # Add ops users to the ops group.
     if [[ "$role" == "ops" ]]; then
-        [[ "$team" == "ops" ]] ||
-            error_exit "Ops role must belong to the ops team: $username"
+        usermod -aG ops "$username" ||
+            error_exit "Could not add $username to ops group"
 
-        usermod -aG ops "$username"
-        log_action "Added $username to ops group; sudo is not enabled yet"
+        log_action "Added $username to ops group"
     fi
 
 done < "$CSV_FILE"
 
-log_action "Onboarding completed"
+# Enable the approved sudoers policy if the CSV contains an ops role.
+if [[ "$ops_needed" == true ]]; then
+    configure_ops_sudo
+fi
+
+log_action "Onboarding process completed"
